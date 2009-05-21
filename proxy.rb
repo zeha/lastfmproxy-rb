@@ -68,7 +68,7 @@ class LastFmResponse
 end
 
 class LastFmTrack
-  attr_accessor :location, :title, :album, :creator, :duration, :artistpage, :trackpage
+  attr_reader :location, :title, :album, :creator, :duration, :artistpage, :trackpage
   def initialize(args)
     @location = args[:location]
     @title = args[:title]
@@ -82,13 +82,14 @@ end
 
 class LastFmWebservice
   attr_accessor :radio_tracks, :sk
+  attr_reader :radio_title
 
   def initialize(api_key, api_secret)
-    @http = Net::HTTP.new('ws.audioscrobbler.com')
     @api_key = api_key
     @api_secret = api_secret
     @sk = nil
     @radio_tracks = nil
+    @radio_title = nil
     @last_radio_rtp = nil
     @last_radio_discovery = nil
   end
@@ -115,12 +116,13 @@ class LastFmWebservice
     # escape
     args_string = URI.escape(args_string)
 
+    http = Net::HTTP.new('ws.audioscrobbler.com')
     if readwrite == :read
       uri = "/2.0/?" + args_string
-      rsp = @http.get(uri)
+      rsp = http.get(uri)
     elsif readwrite == :write
       uri = "/2.0/"
-      rsp = @http.post(uri, args_string)
+      rsp = http.post(uri, args_string)
     else
       raise "Unknown readwrite '%s' specified" % readwrite.to_s
     end
@@ -129,7 +131,7 @@ class LastFmWebservice
 
   def handle_error(response)
     puts "ERROR ERROR ERROR ERROR ERROR ERROR"
-    puts response
+    puts "XML Response: %s" % response.xml.to_s
     puts "-----------------------------------"
     raise response.xml.to_s
   end
@@ -152,6 +154,8 @@ class LastFmWebservice
         r[elem.name.to_sym] = elem.text
       end
     end
+    @radio_title = station
+    @radio_title = r[:name] if r.has_key?(:name)
     r
   end
 
@@ -160,8 +164,9 @@ class LastFmWebservice
     handle_error(response) unless response.status
     @radio_tracks = [] if @radio_tracks.nil?
     response.xml.elements.each('lfm/playlist/title') do |elem|
-      puts "fetched new tracks for radio %s" % elem.text
+      @radio_title = elem.text if !elem.text.nil?
     end
+    puts "fetched new tracks for radio %s" % @radio_title
     response.xml.elements.each('lfm/playlist/trackList/track') do |track|
       args = {}
       track.elements.each do |elem|
@@ -201,8 +206,9 @@ class LastFmProxyServer < WEBrick::GenericServer
   def initialize(lastfm, args)
     @lastfm = lastfm
     @want_shutdown = false
-    @want_shutdown_count = 0
     @default_radio_station = nil
+    @metadata_interval = 8192
+    @bitrate = 128
     super(args)
   end
   def run(sock)
@@ -210,15 +216,24 @@ class LastFmProxyServer < WEBrick::GenericServer
       sock.read_nonblock(2000)
     rescue
     end
-    sock.print "HTTP/1.0 200 OK\r\n"
-    sock.print "Connection: close\r\n"
-    sock.print "Content-Type: audio/mpeg\r\n"
-    sock.print "\r\n"
+
     radio_station = @default_radio_station
     puts ""
     puts ""
-    puts "Starting radio %s ..." % radio_station
+    puts "Starting radio (URL %s) ..." % radio_station
     @lastfm.radio_tune(radio_station)
+    @lastfm.radio_getPlaylist(0, 0)
+
+    sock.print "ICY 200 OK\r\n"
+    sock.print "Content-Type: audio/mpeg\r\n"
+    sock.print "icy-notice1: This stream requires <a href=\"http://www.winamp.com/\">Winamp</a>\r\n"
+    sock.print "icy-notice2: lastfmproxy-rb\r\n"
+    sock.print "icy-name: Last.FM: %s\r\n" % @lastfm.radio_title
+    sock.print "icy-url: %s\r\n" % radio_station
+    sock.print "icy-genre: Unknown Genre\r\n"
+    sock.print "icy-pub: 0\r\n"
+    sock.print "icy-br: %d\r\n" % @bitrate
+    sock.print "\r\n"
     track = 0
     while !track.nil? and !@want_shutdown do
       track = @lastfm.radio_nextTrack do |error|
@@ -226,22 +241,22 @@ class LastFmProxyServer < WEBrick::GenericServer
         puts error.xml
         exit
       end
+      puts ""
       puts "playing: %s - %s" % [track.creator, track.title]
       puts "artist info: %s" % track.artistpage
       puts "track info: %s" % track.trackpage
       puts ""
-      fetch_and_send_track track.location, sock
+      fetch_and_send_track track.location, track, sock
     end
     puts "Quitting radio."
   end
   def shutdown
+    exit if @want_shutdown
     @want_shutdown = true
-    @want_shutdown_count += 1
-    exit if @want_shutdown_count > 3
     super()
   end
   private
-  def fetch_and_send_track(uri_str, sock, limit = 10, &block)
+  def fetch_and_send_track(uri_str, track, sock, limit = 10, &block)
     raise ArgumentError, 'HTTP redirect too deep' if limit == 0
     puts 'fetching from %s' % uri_str
     uri = URI.parse(uri_str)
@@ -249,8 +264,9 @@ class LastFmProxyServer < WEBrick::GenericServer
 
     len = 0
     no_more = false
+    headers = { 'Accept' => 'audio/mpeg', 'User-Agent' => 'lastfmproxy-rb' }
     begin
-      response = http.get uri.path do |segment|
+      response = http.get uri.path, headers do |segment|
         return if no_more
         if @want_shutdown
           no_more = true
@@ -278,7 +294,7 @@ class LastFmProxyServer < WEBrick::GenericServer
     end
     case response
     when Net::HTTPSuccess     then response
-    when Net::HTTPRedirection then fetch_and_send_track(response['location'], sock, limit - 1, &block)
+    when Net::HTTPRedirection then fetch_and_send_track(response['location'], track, sock, limit - 1, &block)
     else
       response.error!
     end
@@ -293,7 +309,7 @@ server = LastFmProxyServer.new( lfm, :Port => 2000 )
 puts "Default radio station: %s" % station
 server.default_radio_station = station
 trap("INT") {
-  puts "(caught SIGINT, shutting down; running track may continue downloading)"
+  puts "(caught SIGINT, shutting down; do it again to try harder)"
   server.shutdown
 }
 server.start
