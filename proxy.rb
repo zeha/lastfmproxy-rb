@@ -8,6 +8,10 @@ api_secret = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
 
 # don't need to change anything below
 
+if File.exists?('./config.rb')
+  eval(File.read('./config.rb'))
+end
+
 require 'net/http'
 require 'uri'
 require 'digest/md5'
@@ -29,13 +33,15 @@ class LastFmResponse
 end
 
 class LastFmTrack
-  attr_accessor :location, :title, :album, :creator, :duration
+  attr_accessor :location, :title, :album, :creator, :duration, :artistpage, :trackpage
   def initialize(args)
     @location = args[:location]
     @title = args[:title]
     @album = args[:album]
     @creator = args[:creator]
     @duration = args[:duration]
+    @artistpage = args[:artistpage]
+    @trackpage = args[:trackpage]
   end
   def fetch(&block)
     fetch_uri(@location, &block)
@@ -132,14 +138,22 @@ class LastFmWebservice
   end
 
   def radio_getPlaylist(rtp, discovery)
-    puts "fetching new tracks"
     response = request('radio.getPlaylist', :read, {:rtp => rtp, :discovery => discovery})
     handle_error(response) unless response.status
     @radio_tracks = [] if @radio_tracks.nil?
+    response.xml.elements.each('lfm/playlist/title') do |elem|
+      puts "fetched new tracks for radio %s" % elem.text
+    end
     response.xml.elements.each('lfm/playlist/trackList/track') do |track|
       args = {}
       track.elements.each do |elem|
-        args[elem.name.to_sym] = elem.text
+        if elem.name == 'extension'
+          elem.elements.each do |extelem|
+            args[extelem.name.to_sym] = extelem.text
+          end
+        else
+          args[elem.name.to_sym] = elem.text
+        end
       end
       @radio_tracks << LastFmTrack.new(args)
     end
@@ -149,9 +163,9 @@ class LastFmWebservice
   end
 
   def radio_nextTrack()
-    if @radio_tracks.nil? or @radio_tracks.count < 2
+    if @radio_tracks.nil? or @radio_tracks.length < 2
       response = radio_getPlaylist(@last_radio_rtp, @last_radio_discovery)
-      if @radio_tracks.nil? or @radio_tracks.count == 0
+      if @radio_tracks.nil? or @radio_tracks.length == 0
         begin
           yield response
         rescue
@@ -164,10 +178,12 @@ class LastFmWebservice
 
 end
 
-class LastFmWebserver < WEBrick::GenericServer
+class LastFmProxyServer < WEBrick::GenericServer
+  attr_accessor :default_radio_station
   def initialize(lastfm, args)
     @lastfm = lastfm
     @want_shutdown = false
+    @default_radio_station = nil
     super(args)
   end
   def run(sock)
@@ -179,6 +195,11 @@ class LastFmWebserver < WEBrick::GenericServer
     sock.print "Connection: close\r\n"
     sock.print "Content-Type: audio/mpeg\r\n"
     sock.print "\r\n"
+    radio_station = @default_radio_station
+    puts ""
+    puts ""
+    puts "Starting radio %s ..." % radio_station
+    @lastfm.radio_tune(radio_station)
     track = 0
     while !track.nil? and !@want_shutdown do
       track = @lastfm.radio_nextTrack do |error|
@@ -186,17 +207,23 @@ class LastFmWebserver < WEBrick::GenericServer
         puts error.xml
         exit
       end
-      puts "playing: %s" % track.title
+      puts "playing: %s - %s" % [track.creator, track.title]
+      puts "artist info: %s" % track.artistpage
+      puts "track info: %s" % track.trackpage
       puts ""
       len = 0
       track.fetch do |segment|
         sock.write segment
         sock.flush
         len = len + segment.length
-        $stdout.write "\r %d bytes already..." % len if len > 0
+        $stdout.write "\r %d bytes already...       " % len if len > 0
+        if @want_shutdown
+          exit
+        end
       end
       puts "\r"
     end
+    puts "Quitting radio."
   end
   def shutdown
     @want_shutdown = true
@@ -206,9 +233,10 @@ end
 
 lfm = LastFmWebservice.new(api_key, api_secret)
 lfm.auth(username, password)
-lfm.radio_tune(station)
 
-server = LastFmWebserver.new( lfm, :Port => 2000 )
+server = LastFmProxyServer.new( lfm, :Port => 2000 )
+puts "Default radio station: %s" % station
+server.default_radio_station = station
 trap("INT") { server.shutdown }
 server.start
 
