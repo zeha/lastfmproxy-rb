@@ -78,23 +78,6 @@ class LastFmTrack
     @artistpage = args[:artistpage]
     @trackpage = args[:trackpage]
   end
-  def fetch(&block)
-    fetch_uri(@location, &block)
-  end
-  private
-  def fetch_uri(uri_str, limit = 10, &block)
-    raise ArgumentError, 'HTTP redirect too deep' if limit == 0
-    puts 'fetching from %s' % uri_str
-    uri = URI.parse(uri_str)
-    http = Net::HTTP.new(uri.host, uri.port)
-    response = http.get(uri.path, &block)
-    case response
-    when Net::HTTPSuccess     then response
-    when Net::HTTPRedirection then fetch_uri(response['location'], limit - 1, &block)
-    else
-      response.error!
-    end
-  end
 end
 
 class LastFmWebservice
@@ -218,6 +201,7 @@ class LastFmProxyServer < WEBrick::GenericServer
   def initialize(lastfm, args)
     @lastfm = lastfm
     @want_shutdown = false
+    @want_shutdown_count = 0
     @default_radio_station = nil
     super(args)
   end
@@ -246,24 +230,60 @@ class LastFmProxyServer < WEBrick::GenericServer
       puts "artist info: %s" % track.artistpage
       puts "track info: %s" % track.trackpage
       puts ""
-      len = 0
-      track.fetch do |segment|
-        sock.write segment
-        sock.flush
-        len = len + segment.length
-        $stdout.write "\r %d bytes already...       " % len if len > 0
-        if @want_shutdown
-          exit
-        end
-      end
-      puts "\r"
+      fetch_and_send_track track.location, sock
     end
     puts "Quitting radio."
   end
   def shutdown
     @want_shutdown = true
+    @want_shutdown_count += 1
+    exit if @want_shutdown_count > 3
     super()
   end
+  private
+  def fetch_and_send_track(uri_str, sock, limit = 10, &block)
+    raise ArgumentError, 'HTTP redirect too deep' if limit == 0
+    puts 'fetching from %s' % uri_str
+    uri = URI.parse(uri_str)
+    http = Net::HTTP.new(uri.host, uri.port)
+
+    len = 0
+    no_more = false
+    begin
+      response = http.get uri.path do |segment|
+        return if no_more
+        if @want_shutdown
+          no_more = true
+          http.finish
+        end
+        begin
+          sock.write segment
+          sock.flush
+        rescue => detail
+          puts detail
+          no_more = true
+          http.finish
+        end
+        len = len + segment.length
+        $stdout.write "\r   %d bytes already...       " % len if len > 0
+      end
+      puts "\r\n"
+    rescue => detail
+      case detail
+      when IOError then return
+      else
+        puts detail
+        return
+      end
+    end
+    case response
+    when Net::HTTPSuccess     then response
+    when Net::HTTPRedirection then fetch_and_send_track(response['location'], sock, limit - 1, &block)
+    else
+      response.error!
+    end
+  end
+
 end
 
 lfm = LastFmWebservice.new(api_key, api_secret)
@@ -272,7 +292,10 @@ lfm.auth(username, password)
 server = LastFmProxyServer.new( lfm, :Port => 2000 )
 puts "Default radio station: %s" % station
 server.default_radio_station = station
-trap("INT") { server.shutdown }
+trap("INT") {
+  puts "(caught SIGINT, shutting down; running track may continue downloading)"
+  server.shutdown
+}
 server.start
 
 
