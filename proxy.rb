@@ -33,19 +33,18 @@
 #
 # Configuration:
 # Copy the following section to ./config.rb and edit it there.
-username = 'USERNAME'
-password = 'PASSWORD'
-station = 'lastfm://user/'+username+'/personal'
-api_key = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
-api_secret = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+config = {
+  :username => 'USERNAME',
+  :password => 'PASSWORD',
+  :station => 'lastfm://artist/moloko/similarartists',
+  :api_key => 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+  :api_secret => 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+}
 # ----------------------------------------------------------------------------
 #
 # don't need to change anything below
 #
 
-if File.exists?('./config.rb')
-  eval(File.read('./config.rb'))
-end
 
 require 'net/http'
 require 'uri'
@@ -255,7 +254,28 @@ class LastFmProxyServer < WEBrick::GenericServer
     @want_shutdown = true
     super()
   end
+
+  # the real main method
+  def LastFmProxyServer.main(config)
+    if File.exists?('./config.rb')
+      eval(File.read('./config.rb'))
+    end
+
+    lfm = LastFmWebservice.new(config[:api_key], config[:api_secret])
+    lfm.auth(config[:username], config[:password])
+
+    server = LastFmProxyServer.new( lfm, :Port => 2000 )
+    server.default_radio_station = config[:station]
+    puts "Default radio station: %s" % server.default_radio_station
+    trap("INT") {
+      puts "(caught SIGINT, shutting down; do it again to try harder)"
+      server.shutdown
+    }
+    server.start
+  end
+
   private
+
   def fetch_and_send_track(uri_str, track, sock, limit = 10, &block)
     raise ArgumentError, 'HTTP redirect too deep' if limit == 0
     puts 'fetching from %s' % uri_str
@@ -302,16 +322,5 @@ class LastFmProxyServer < WEBrick::GenericServer
 
 end
 
-lfm = LastFmWebservice.new(api_key, api_secret)
-lfm.auth(username, password)
-
-server = LastFmProxyServer.new( lfm, :Port => 2000 )
-puts "Default radio station: %s" % station
-server.default_radio_station = station
-trap("INT") {
-  puts "(caught SIGINT, shutting down; do it again to try harder)"
-  server.shutdown
-}
-server.start
-
+LastFmProxyServer.main config if $0 == __FILE__
 
