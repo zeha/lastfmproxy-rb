@@ -1,0 +1,8 @@
+config = {
+  :username => 'USERNAME',
+  :password => 'PASSWORD',
+  :station => 'lastfm://artist/moloko/similarartists',
+  :api_key => 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+  :api_secret => 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+}
+
